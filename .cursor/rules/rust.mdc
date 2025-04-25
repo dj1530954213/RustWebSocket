@@ -1,0 +1,38 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+{
+  "name": "Rust Project Standards",
+  "description": "Rules for maintaining high-quality Rust codebase.",
+  "scope": "project",
+  "rules": [
+    {
+      "name": "Follow Rust Coding Conventions",
+      "description": "All Rust code must strictly adhere to the official Rust coding guidelines and idioms, including formatting, naming conventions, module structure, and error handling.",
+      "severity": "error"
+    },
+    {
+      "name": "Avoid Unnecessary Clones",
+      "description": "Avoid using `.clone()` unless absolutely necessary. Consider borrowing, references, or alternative approaches to manage ownership efficiently and reduce heap allocations.",
+      "severity": "warning"
+    },
+    {
+      "name": "Run `cargo check` After Every Change",
+      "description": "After every code modification, developers must run `cargo check` to ensure the code compiles without errors. Any errors must be resolved immediately before proceeding.",
+      "severity": "error"
+    },
+    {
+      "name": "Mandatory Comments for Changes",
+      "description": "All new functions, modules, or significant logic changes must include detailed comments explaining their purpose, inputs, outputs, and edge cases.",
+      "severity": "warning"
+    },
+    {
+      "name": "Update README After Code Changes",
+      "description": "Whenever functionality is changed or added, the README file must be updated accordingly to reflect the latest usage, features, and examples.",
+      "severity": "warning"
+    }
+  ]
+}

@@ -1,24 +1,22 @@
-use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
-use std::io::{self, Write};
-use tokio::sync::{mpsc, Mutex};
-use std::sync::Arc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use url::Url;
-use log::{info, error};
+mod message;
+mod connection;
+mod heartbeat;
 
-// 定义消息类型，与服务器端保持一致
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct WrappedMessage {
-    group_id: String,       // 组ID
-    sender_type: String,    // 发送方类型: "center" 或 "local"
-    receiver_type: String,  // 接收方类型: "center" 或 "local"
-    content: String,        // 消息内容
-}
+use futures_util::StreamExt;
+use std::io::{self, Write};
+use tokio_tungstenite::tungstenite::Message;
+use log::{error, info, warn};
+
+use message::{WrappedMessage, MessageService};
+use connection::WebSocketConnection;
+use heartbeat::HeartbeatManager;
 
 #[tokio::main]
 async fn main() {
     // 初始化日志
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
+    }
     env_logger::init();
     
     // 获取用户输入的组ID
@@ -32,11 +30,12 @@ async fn main() {
         return;
     }
     
-    // 连接到WebSocket服务器
-    let url = Url::parse("ws://127.0.0.1:8080").expect("无效的URL");
+    // 创建消息服务
+    let message_service = MessageService::new(group_id);
     
+    // 连接到WebSocket服务器
     println!("正在连接到服务器...");
-    let (ws_stream, _) = match connect_async(url).await {
+    let (connection, ws_receiver) = match WebSocketConnection::new("ws://127.0.0.1:8080").await {
         Ok(conn) => conn,
         Err(e) => {
             error!("连接服务器失败: {}", e);
@@ -47,30 +46,30 @@ async fn main() {
     
     println!("已连接到服务器");
     
-    let (ws_sender, ws_receiver) = ws_stream.split();
-    
-    // 使用Arc和Mutex保护ws_sender，以便在多个任务间共享
-    let ws_sender = Arc::new(Mutex::new(ws_sender));
-    
     // 发送初始化消息
-    let init_msg = WrappedMessage {
-        group_id: group_id.clone(),
-        sender_type: "center".to_string(),
-        receiver_type: "server".to_string(),
-        content: "初始化连接".to_string(),
+    if let Err(e) = connection.send_init_message(&message_service).await {
+        error!("发送初始化消息失败: {}", e);
+        println!("发送初始化消息失败: {}", e);
+        return;
+    }
+    
+    // 创建心跳管理器 - 复制connection用于心跳任务
+    let heartbeat_connection = WebSocketConnection {
+        sender: connection.sender.clone(),
+        url: connection.url.clone(),
     };
+    let heartbeat_service = MessageService::new(message_service.group_id.clone());
+    let heartbeat_manager = HeartbeatManager::new(heartbeat_service, heartbeat_connection, 20);
     
-    let init_json = serde_json::to_string(&init_msg).expect("序列化失败");
-    println!("发送初始化消息: {}", init_json);
-    
-    // 通过临时获取锁发送初始化消息
-    let mut sender_lock = ws_sender.lock().await;
-    sender_lock.send(Message::Text(init_json)).await.expect("发送初始化消息失败");
-    drop(sender_lock); // 释放锁
+    // 启动心跳任务
+    heartbeat_manager.start_heartbeat_task().await;
     
     // 创建用户输入任务
-    let ws_sender_clone = ws_sender.clone();
-    let group_id_clone = group_id.clone();
+    let input_connection = WebSocketConnection {
+        sender: connection.sender.clone(),
+        url: connection.url.clone(),
+    };
+    let input_service = MessageService::new(message_service.group_id.clone());
     
     let input_task = tokio::spawn(async move {
         println!("启动用户输入任务...");
@@ -90,38 +89,26 @@ async fn main() {
             }
             
             if input == "/quit" {
+                // 发送断开连接消息到服务器
+                info!("发送断开连接消息");
+                let disconnect_msg = input_service.create_disconnect_message();
+                match input_connection.send_message(&disconnect_msg).await {
+                    Ok(_) => println!("断开连接消息发送成功"),
+                    Err(e) => println!("断开连接消息发送失败: {}", e),
+                }
                 break;
             }
             
             println!("收到用户输入: {}", input);
             
-            // 创建消息
-            let msg = WrappedMessage {
-                group_id: group_id_clone.clone(),
-                sender_type: "center".to_string(),
-                receiver_type: "local".to_string(),
-                content: input.to_string(),
-            };
-            
-            // 序列化并发送消息
-            match serde_json::to_string(&msg) {
-                Ok(json) => {
-                    println!("准备发送消息到WebSocket: {}", json);
-                    // 获取锁并发送消息
-                    let mut sender = ws_sender_clone.lock().await;
-                    match sender.send(Message::Text(json.clone())).await {
-                        Ok(_) => println!("消息成功发送到WebSocket服务器"),
-                        Err(e) => {
-                            error!("发送消息到WebSocket失败: {}", e);
-                            println!("发送消息到WebSocket失败: {}", e);
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("序列化消息失败: {}", e);
-                    println!("序列化消息失败: {}", e);
-                }
+            // 创建并发送消息
+            let msg = input_service.create_message(input.to_string());
+            if let Err(e) = input_connection.send_message(&msg).await {
+                error!("发送消息失败: {}", e);
+                println!("发送消息失败: {}", e);
+                break;
+            } else {
+                println!("消息发送成功");
             }
         }
         
@@ -129,6 +116,8 @@ async fn main() {
     });
     
     // 创建WebSocket消息接收任务
+    let receiver_service = MessageService::new(message_service.group_id.clone());
+    
     let receiver_task = tokio::spawn(async move {
         println!("开始监听接收消息...");
         
@@ -138,7 +127,7 @@ async fn main() {
                 Ok(msg) => {
                     match msg {
                         Message::Text(text) => {
-                            println!("\n收到文本消息: {}", text);
+                            //println!("\n收到文本消息: {}", text);
                             match serde_json::from_str::<WrappedMessage>(&text) {
                                 Ok(msg) => {
                                     println!("\n==== 收到消息 ====");
@@ -146,19 +135,27 @@ async fn main() {
                                     println!("接收方: {}", msg.receiver_type);
                                     println!("组ID: {}", msg.group_id);
                                     println!("内容: {}", msg.content);
+                                    if let Some(msg_type) = &msg.message_type {
+                                        println!("消息类型: {}", msg_type);
+                                    }
                                     println!("==================\n");
                                     
-                                    match msg.sender_type.as_str() {
-                                        "server" => {
-                                            println!("\n[服务器]: {}", msg.content);
-                                        }
-                                        "local" => {
-                                            println!("\n[Local -> Center]: {}", msg.content);
-                                        }
-                                        _ => {
-                                            println!("\n[未知发送方 {}]: {}", msg.sender_type, msg.content);
-                                        }
+                                    // 使用消息服务处理消息
+                                    let formatted_msg = receiver_service.process_received_message(&msg);
+                                    println!("{}", formatted_msg);
+                                    
+                                    // 判断是否是断开连接通知，如果是则可以考虑自动退出
+                                    if receiver_service.is_disconnect_notification(&msg) {
+                                        warn!("\n对方已断开连接，无法发送消息！");
+                                        println!("\n对方已断开连接，按回车继续或输入/quit退出");
                                     }
+                                    
+                                    // 判断是否是上线通知
+                                    if receiver_service.is_connect_notification(&msg) {
+                                        info!("\n对方已上线连接，可以开始发送消息");
+                                        println!("\n对方已上线连接，可以开始聊天");
+                                    }
+                                    
                                     print!("请输入消息(发送给local): ");
                                     io::stdout().flush().unwrap();
                                 },
@@ -173,6 +170,7 @@ async fn main() {
                         Message::Pong(_) => println!("\n收到pong"),
                         Message::Close(frame) => {
                             println!("\n收到关闭消息: {:?}", frame);
+                            println!("\n服务器已断开连接");
                             break;
                         },
                         Message::Frame(_) => println!("\n收到帧消息"),
@@ -180,6 +178,7 @@ async fn main() {
                 },
                 Err(e) => {
                     println!("\n接收消息错误: {}", e);
+                    println!("\n与服务器的连接已断开");
                     break;
                 }
             }
